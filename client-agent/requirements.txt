@@ -1,0 +1,10 @@
+opencv-python
+numpy
+torch
+ultralytics
+mediapipe
+requests
+speechrecognition
+pyaudio
+urllib3
+argparse
