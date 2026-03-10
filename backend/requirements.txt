@@ -1,0 +1,11 @@
+Flask
+Flask-Cors
+Werkzeug
+reportlab
+requests
+python-dateutil
+simplejson
+reportlab 
+gunicorn
+pandas
+numpy
