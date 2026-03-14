@@ -5,29 +5,25 @@ from werkzeug.security import generate_password_hash
 conn = sqlite3.connect('proctoring_data.db')
 cursor = conn.cursor()
 
-# Show current users
-print("👥 Current users:")
-cursor.execute("SELECT id, username, role FROM users")
-for user in cursor.fetchall():
-    print(f"   ID: {user[0]}, Username: {user[1]}, Role: {user[2]}")
+# Reset NEGA's password
+username = "NEGA"
+new_password = "bitsathyl16"  # You can change this
 
-# Reset vishwas password to 'admin123'
-new_password = generate_password_hash('admin123')
+# Generate password hash
+password_hash = generate_password_hash(new_password)
+
+# Update the password
 cursor.execute("""
     UPDATE users 
     SET password_hash = ? 
-    WHERE username = 'vishwas'
-""", (new_password,))
+    WHERE username = ?
+""", (password_hash, username))
+
+if cursor.rowcount > 0:
+    print(f"✅ Password reset successful for {username}")
+    print(f"   New password: {new_password}")
+else:
+    print(f"❌ User {username} not found!")
 
 conn.commit()
-
-# Verify it worked
-cursor.execute("SELECT username, role FROM users WHERE username = 'vishwas'")
-result = cursor.fetchone()
-if result:
-    print(f"\n✅ Password reset successful for: {result[0]} ({result[1]})")
-    print(f"   New password: admin123")
-else:
-    print("\n❌ User 'vishwas' not found!")
-
 conn.close()
