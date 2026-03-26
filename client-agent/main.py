@@ -4,6 +4,7 @@ ProctorAI Client - ENHANCED EDITION with Superior Detection
 - Better face detection with multiple algorithms
 - Improved voice detection with continuous monitoring
 - Object detection for phones, books, etc.
+- BACKGROUND MODE SUPPORT (--background flag)
 """
 
 import warnings
@@ -83,22 +84,37 @@ EXIT_ON_SERIOUS_ALERT = True
 parser = argparse.ArgumentParser(description="ProctorAI Client Agent")
 parser.add_argument('--username', type=str, required=True, help="The student's username")
 parser.add_argument('--exam_id', type=str, required=True, help="The unique ID for this exam")
+parser.add_argument('--session_id', type=str, help="Session ID (if not provided, will be generated)")
 parser.add_argument('--no-yolo', action='store_true', help="Disable YOLO to save memory")
 parser.add_argument('--no-voice', action='store_true', help="Disable voice detection")
 parser.add_argument('--low-res', action='store_true', help="Use lower resolution (320x240)")
 parser.add_argument('--serious-threshold', type=int, default=5, help="Consecutive frames before exit")
+parser.add_argument('--background', action='store_true', help="Run in background mode (no window)")
+parser.add_argument('--no-exit', action='store_true', help="Don't exit on serious violations (for testing)")
 args = parser.parse_args()
+
+# Background mode setting
+BACKGROUND_MODE = args.background
+if BACKGROUND_MODE:
+    print("[🔇] Running in BACKGROUND MODE (no window)")
 
 CONSECUTIVE_SERIOUS_THRESHOLD = args.serious_threshold
 
 STUDENT_ID = args.username
 EXAM_ID = args.exam_id
-SESSION_ID = f"exam_{EXAM_ID}_{STUDENT_ID}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+# Use provided session_id or generate one
+if args.session_id:
+    SESSION_ID = args.session_id
+else:
+    SESSION_ID = f"exam_{EXAM_ID}_{STUDENT_ID}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
 print(f"[🚀] Initializing ProctorAI Agent...")
 print(f"    Student: {STUDENT_ID}")
 print(f"    Exam ID: {EXAM_ID}")
 print(f"    Session ID: {SESSION_ID}")
+if BACKGROUND_MODE:
+    print(f"    Mode: BACKGROUND (no window)")
 
 # Resolution settings
 FRAME_WIDTH = 320 if args.low_res else 480
@@ -199,7 +215,8 @@ def improved_voice_listener():
             while running:
                 try:
                     with mic as source:
-                        print("[🎤] Listening...")
+                        if not BACKGROUND_MODE:
+                            print("[🎤] Listening...")
                         audio = recognizer.listen(source, timeout=1, phrase_time_limit=5)
                         
                     try:
@@ -484,7 +501,8 @@ if __name__ == "__main__":
         print("[⚠️] YOLO detection disabled")
 
     print(f"[🎥] Camera started at {FRAME_WIDTH}x{FRAME_HEIGHT}")
-    print("    Press 'q' to quit")
+    if not BACKGROUND_MODE:
+        print("    Press 'q' to quit")
 
     try:
         frame_count = 0
@@ -582,17 +600,18 @@ if __name__ == "__main__":
                         except Exception as e:
                             pass
             
-            # Check for serious violations
-            if EXIT_ON_SERIOUS_ALERT and has_serious_alert:
+            # Check for serious violations (only if not in test mode)
+            if EXIT_ON_SERIOUS_ALERT and has_serious_alert and not args.no_exit:
                 serious_alert_counter += 1
                 serious_alert_message = next(
                     (a for a in frame_alerts if any(s in a for s in ["PHONE", "Multiple faces", "BOOK", "LAPTOP"])),
                     "Serious violation"
                 )
                 
-                # Show warning
-                cv2.putText(frame, f"⚠️ WARNING: {serious_alert_counter}/{CONSECUTIVE_SERIOUS_THRESHOLD}", 
-                           (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                # Show warning only if not in background mode
+                if not BACKGROUND_MODE:
+                    cv2.putText(frame, f"⚠️ WARNING: {serious_alert_counter}/{CONSECUTIVE_SERIOUS_THRESHOLD}", 
+                               (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
                 
                 if serious_alert_counter >= CONSECUTIVE_SERIOUS_THRESHOLD:
                     exam_terminated = True
@@ -613,44 +632,47 @@ if __name__ == "__main__":
                     except:
                         pass
                     
-                    # Show termination screen
-                    for i in range(5):
-                        display = frame.copy()
-                        cv2.putText(display, "❌ EXAM TERMINATED", (50, 100), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
-                        cv2.putText(display, f"Reason: {serious_alert_message}", (50, 150), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                        cv2.imshow("ProctorAI Client", display)
-                        cv2.waitKey(500)
+                    # Only show termination screen if not in background mode
+                    if not BACKGROUND_MODE:
+                        for i in range(5):
+                            display = frame.copy()
+                            cv2.putText(display, "❌ EXAM TERMINATED", (50, 100), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+                            cv2.putText(display, f"Reason: {serious_alert_message}", (50, 150), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                            cv2.imshow("ProctorAI Client", display)
+                            cv2.waitKey(500)
                     
                     time.sleep(2)
                     break
             else:
                 serious_alert_counter = max(0, serious_alert_counter - 1)
             
-            # Draw face boxes for visualization
-            for (x, y, w, h) in face_boxes:
-                color = (0, 255, 0) if face_count == 1 else (0, 0, 255)
-                cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
-            
-            # Display information
-            y_offset = 30
-            cv2.putText(frame, f"Faces: {face_count}", (10, y_offset), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            
-            y_offset += 20
-            cv2.putText(frame, f"Voice: {'ACTIVE' if voice_active else 'inactive'}", 
-                       (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 
-                       (0, 255, 0) if voice_active else (100, 100, 100), 1)
-            
-            # Show alerts
-            y_offset += 25
-            for alert in list(frame_alerts)[:4]:
-                cv2.putText(frame, f"• {alert}", (10, y_offset), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
-                y_offset += 18
-            
-            cv2.imshow("ProctorAI Client", frame)
+            # Only draw visualization if not in background mode
+            if not BACKGROUND_MODE:
+                # Draw face boxes for visualization
+                for (x, y, w, h) in face_boxes:
+                    color = (0, 255, 0) if face_count == 1 else (0, 0, 255)
+                    cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+                
+                # Display information
+                y_offset = 30
+                cv2.putText(frame, f"Faces: {face_count}", (10, y_offset), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                
+                y_offset += 20
+                cv2.putText(frame, f"Voice: {'ACTIVE' if voice_active else 'inactive'}", 
+                           (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 
+                           (0, 255, 0) if voice_active else (100, 100, 100), 1)
+                
+                # Show alerts
+                y_offset += 25
+                for alert in list(frame_alerts)[:4]:
+                    cv2.putText(frame, f"• {alert}", (10, y_offset), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+                    y_offset += 18
+                
+                cv2.imshow("ProctorAI Client", frame)
             
             # Send data periodically
             if time.time() - last_send_time >= 2.0 and not exam_terminated:
@@ -680,15 +702,20 @@ if __name__ == "__main__":
                 except queue.Full:
                     pass
             
-            # Handle quit
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            # Handle quit (only if not in background mode)
+            if not BACKGROUND_MODE and cv2.waitKey(1) & 0xFF == ord('q'):
                 break
             
-            # Periodic stats
+            # Periodic stats (less frequent in background mode)
             if frame_count % 100 == 0:
-                print(f"\n[Stats] Frames: {detection_stats['total_frames']}, "
-                      f"Faces detected: {detection_stats['faces_detected']}, "
-                      f"Voice events: {detection_stats['voice_events']}\n")
+                if BACKGROUND_MODE:
+                    # Minimal logging in background mode
+                    if frame_alerts:
+                        print(f"[Background] Alerts: {list(frame_alerts)}")
+                else:
+                    print(f"\n[Stats] Frames: {detection_stats['total_frames']}, "
+                          f"Faces detected: {detection_stats['faces_detected']}, "
+                          f"Voice events: {detection_stats['voice_events']}\n")
                 gc.collect()
 
     except KeyboardInterrupt:
@@ -697,7 +724,8 @@ if __name__ == "__main__":
         running = False
         print("[⚙️] Shutting down...")
         cap.release()
-        cv2.destroyAllWindows()
+        if not BACKGROUND_MODE:
+            cv2.destroyAllWindows()
         time.sleep(0.5)
         
         if exam_terminated:

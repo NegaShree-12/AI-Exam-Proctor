@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify, send_file, after_this_request, Response
 from flask_cors import CORS
-from flask_socketio import SocketIO
+from flask_socketio import SocketIO, join_room
 import sqlite3
 import json
 import os
@@ -8,13 +8,11 @@ import pandas as pd
 from report_generator import generate_report
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
-import time
-import eventlet
 import uuid
-eventlet.monkey_patch()
-
-# Import WebSocket manager
-from websocket_manager import init_socketio
+import subprocess
+import psutil
+import signal
+import sys
 
 # Import Analytics Engine
 from analytics_engine import AnalyticsEngine
@@ -28,16 +26,19 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max
 app.config['PROPAGATE_EXCEPTIONS'] = True
 
-# Initialize SocketIO
-socketio = init_socketio(app)
+# Initialize SocketIO WITHOUT eventlet
+socketio = SocketIO(app, cors_allowed_origins="*")
 
 # Initialize Analytics Engine
 analytics_engine = AnalyticsEngine()
 
 DATABASE_FILE = 'proctoring_data.db'
 
-# Store active client sessions
-active_client_sessions = {}  # session_token -> {username, exam_id, status, last_heartbeat}
+# Store active web sessions (for live monitoring)
+active_web_sessions = {}  # session_id -> {student_id, exam_id, last_heartbeat, alerts}
+
+# Store background agent processes
+active_agent_sessions = {}  # session_id -> {pid, username, exam_id, started_at}
 
 ALERT_WEIGHTS = {
     "Multiple faces detected!": 25,
@@ -95,6 +96,8 @@ def calculate_integrity_score(alerts):
 def init_db():
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
+    
+    # Users table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -103,6 +106,8 @@ def init_db():
         role TEXT NOT NULL CHECK(role IN ('student', 'admin'))
     );
     """)
+    
+    # Events table for proctoring data
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,6 +119,8 @@ def init_db():
         integrity_score REAL
     );
     """)
+    
+    # Exams table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS exams (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,6 +131,8 @@ def init_db():
         FOREIGN KEY (created_by_admin_id) REFERENCES users (id)
     );
     """)
+    
+    # Exam assignments table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS exam_assignments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -136,132 +145,10 @@ def init_db():
         UNIQUE(exam_id, student_id)
     );
     """)
+    
     conn.commit()
     conn.close()
     print("SQLite database is ready.")
-
-# ===================================================
-# 🔹 CLIENT SESSION MANAGEMENT
-# ===================================================
-
-@app.route('/api/start-client-session', methods=['POST'])
-def start_client_session():
-    """Generate session token for client download and launch"""
-    try:
-        data = request.json
-        username = data.get('username')
-        exam_id = data.get('exam_id')
-        
-        if not username or not exam_id:
-            return jsonify({"error": "Missing username or exam_id"}), 400
-        
-        # Generate unique session token
-        session_token = str(uuid.uuid4())
-        session_id = f"exam_{exam_id}_{username}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        
-        # Store session info
-        active_client_sessions[session_token] = {
-            'username': username,
-            'exam_id': exam_id,
-            'session_id': session_id,
-            'status': 'pending',
-            'created_at': datetime.now().isoformat(),
-            'last_heartbeat': None
-        }
-        
-        # Generate download URL and command
-        if os.name == 'nt':  # Windows
-            client_filename = 'ProctorAI.exe'
-            run_command = f'.\\{client_filename} --username {username} --exam_id {exam_id} --token {session_token}'
-        else:  # Mac/Linux
-            client_filename = 'ProctorAI'
-            run_command = f'./{client_filename} --username {username} --exam_id {exam_id} --token {session_token}'
-        
-        download_url = f"{request.host_url}api/download-client/{client_filename}"
-        
-        return jsonify({
-            'success': True,
-            'session_token': session_token,
-            'session_id': session_id,
-            'download_url': download_url,
-            'command': run_command,
-            'client_filename': client_filename
-        })
-        
-    except Exception as e:
-        print(f"Error starting client session: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/check-client-status/<session_token>', methods=['GET'])
-def check_client_status(session_token):
-    """Check if client has connected"""
-    if session_token in active_client_sessions:
-        session = active_client_sessions[session_token]
-        return jsonify({
-            'status': session['status'],
-            'session_id': session.get('session_id'),
-            'connected_at': session.get('last_heartbeat'),
-            'username': session['username'],
-            'exam_id': session['exam_id']
-        })
-    return jsonify({'status': 'not_found'}), 404
-
-@app.route('/api/client-heartbeat', methods=['POST'])
-def client_heartbeat():
-    """Client sends heartbeat to confirm it's running"""
-    try:
-        data = request.json
-        session_token = data.get('session_token')
-        username = data.get('username')
-        exam_id = data.get('exam_id')
-        
-        if session_token in active_client_sessions:
-            active_client_sessions[session_token]['status'] = 'active'
-            active_client_sessions[session_token]['last_heartbeat'] = datetime.now().isoformat()
-            active_client_sessions[session_token]['session_id'] = data.get('session_id')
-            
-            # Notify via WebSocket
-            socketio.emit('client_connected', {
-                'username': username,
-                'exam_id': exam_id,
-                'session_token': session_token
-            }, room='proctors')
-            
-            return jsonify({'status': 'ok'})
-        return jsonify({'status': 'error', 'message': 'Session not found'}), 404
-    except Exception as e:
-        print(f"Heartbeat error: {e}")
-        return jsonify({'status': 'error'}), 500
-
-@app.route('/api/download-client/<filename>', methods=['GET'])
-def download_client(filename):
-    """Serve the client executable or redirect to GitHub"""
-    try:
-        # First try to serve from local folder
-        client_path = os.path.join(os.path.dirname(__file__), 'client_binaries', filename)
-        
-        if os.path.exists(client_path):
-            return send_file(
-                client_path,
-                as_attachment=True,
-                download_name=filename,
-                mimetype='application/octet-stream'
-            )
-        else:
-            # If file doesn't exist locally, redirect to GitHub release
-            github_url = f"https://github.com/vishwas2222/ProctorAI-Plus/releases/download/v1.0.0/{filename}"
-            print(f"[Download] Redirecting to GitHub: {github_url}")
-            
-            # Return a redirect response
-            return redirect(github_url, code=302)
-            
-    except Exception as e:
-        print(f"Download error: {e}")
-        return jsonify({
-            "error": "Download failed",
-            "message": "Please download manually from GitHub",
-            "download_url": f"https://github.com/vishwas2222/ProctorAI-Plus/releases/download/v1.0.0/{filename}"
-        }), 500
 
 # ===================================================
 # 🔹 AUTH ENDPOINTS
@@ -434,7 +321,8 @@ def get_sessions_for_exam(exam_id):
             e.session_id, 
             e.student_id as student_username, 
             MIN(e.timestamp) as start_time, 
-            MAX(e.integrity_score) as final_score
+            MAX(e.integrity_score) as final_score,
+            COUNT(*) as event_count
         FROM events e
         WHERE e.student_id IN ({placeholders}) 
         AND e.session_id LIKE ?
@@ -459,7 +347,11 @@ def get_student_exams(student_id):
     cursor = conn.cursor()
     cursor.execute("""
         SELECT 
-            e.id as exam_id, e.title, e.description, a.status, a.assigned_at
+            e.id as exam_id, 
+            e.title, 
+            e.description, 
+            a.status, 
+            a.assigned_at
         FROM exam_assignments a
         JOIN exams e ON a.exam_id = e.id
         WHERE a.student_id = ?
@@ -468,6 +360,212 @@ def get_student_exams(student_id):
     exams = [dict(row) for row in cursor.fetchall()]
     conn.close()
     return jsonify(exams)
+
+# ===================================================
+# 🔹 BACKGROUND AGENT ENDPOINTS
+# ===================================================
+
+@app.route('/api/launch-background-agent', methods=['POST'])
+def launch_background_agent():
+    """Launch the proctoring agent in background mode (no window)"""
+    try:
+        data = request.json
+        username = data.get('username')
+        exam_id = data.get('exam_id')
+        session_id = data.get('session_id')
+        
+        if not all([username, exam_id, session_id]):
+            return jsonify({"error": "Missing parameters"}), 400
+        
+        # Path to your existing main.py
+        script_path = os.path.join(os.path.dirname(__file__), '..', 'client-agent', 'main.py')
+        
+        # If script doesn't exist, try alternate path
+        if not os.path.exists(script_path):
+            script_path = os.path.join(os.getcwd(), 'client-agent', 'main.py')
+        
+        # Check if script exists
+        if not os.path.exists(script_path):
+            print(f"⚠️ Agent script not found at: {script_path}")
+            # For testing, we'll simulate success
+            return jsonify({
+                'success': True,
+                'message': 'Simulation mode - agent script not found',
+                'simulation': True
+            }), 200
+        
+        # Launch Python script in background with --background flag
+        if sys.platform == 'win32':
+            # Windows - hide window completely
+            process = subprocess.Popen(
+                [sys.executable, script_path, 
+                 '--username', username, 
+                 '--exam_id', str(exam_id),
+                 '--session_id', session_id,
+                 '--background',  # This makes it run with NO WINDOW
+                 '--no-yolo'],  # Add --no-yolo for faster startup if needed
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
+            )
+        else:
+            # Linux/Mac
+            process = subprocess.Popen(
+                [sys.executable, script_path,
+                 '--username', username,
+                 '--exam_id', str(exam_id),
+                 '--session_id', session_id,
+                 '--background',
+                 '--no-yolo'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True
+            )
+        
+        # Store process info
+        active_agent_sessions[session_id] = {
+            'pid': process.pid,
+            'username': username,
+            'exam_id': exam_id,
+            'started_at': datetime.now().isoformat()
+        }
+        
+        print(f"✅ Background agent launched for {username} (PID: {process.pid})")
+        
+        return jsonify({
+            'success': True,
+            'pid': process.pid,
+            'message': 'Background agent launched'
+        })
+        
+    except Exception as e:
+        print(f"❌ Error launching agent: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/stop-background-agent/<session_id>', methods=['POST'])
+def stop_background_agent(session_id):
+    """Stop the background proctoring agent"""
+    try:
+        if session_id in active_agent_sessions:
+            pid = active_agent_sessions[session_id]['pid']
+            
+            # Kill the process
+            try:
+                if sys.platform == 'win32':
+                    subprocess.run(['taskkill', '/F', '/PID', str(pid)], 
+                                 capture_output=True, timeout=5)
+                else:
+                    os.kill(pid, signal.SIGTERM)
+                
+                print(f"✅ Stopped agent (PID: {pid})")
+            except Exception as e:
+                print(f"⚠️ Error killing process: {e}")
+            
+            del active_agent_sessions[session_id]
+            return jsonify({'success': True})
+        
+        return jsonify({'success': False, 'message': 'Session not found'}), 404
+        
+    except Exception as e:
+        print(f"❌ Error stopping agent: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/check-agent-status/<session_id>', methods=['GET'])
+def check_agent_status(session_id):
+    """Check if background agent is running"""
+    try:
+        if session_id in active_agent_sessions:
+            pid = active_agent_sessions[session_id]['pid']
+            if psutil.pid_exists(pid):
+                return jsonify({'status': 'running'})
+            else:
+                # Clean up if process died
+                del active_agent_sessions[session_id]
+                return jsonify({'status': 'stopped'})
+        
+        # For testing/simulation, return not found
+        return jsonify({'status': 'not_found'}), 404
+    except Exception as e:
+        print(f"Error checking status: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+# ===================================================
+# 🔹 WEB PROCTORING ENDPOINTS
+# ===================================================
+
+@app.route('/api/start-web-session', methods=['POST'])
+def start_web_session():
+    """Start a web-based proctoring session"""
+    try:
+        data = request.json
+        username = data.get('username')
+        exam_id = data.get('exam_id')
+        
+        if not username or not exam_id:
+            return jsonify({"error": "Missing username or exam_id"}), 400
+        
+        # Generate session ID
+        session_id = f"exam_{exam_id}_{username}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        # Store session info
+        active_web_sessions[session_id] = {
+            'username': username,
+            'exam_id': exam_id,
+            'session_id': session_id,
+            'status': 'active',
+            'started_at': datetime.now().isoformat(),
+            'last_heartbeat': datetime.now().isoformat(),
+            'alerts': []
+        }
+        
+        # Log exam start
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO events (student_id, session_id, timestamp, alerts, metrics, integrity_score) VALUES (?, ?, ?, ?, ?, ?)",
+            (username, session_id, datetime.utcnow().isoformat() + "Z", json.dumps(["Exam started"]), json.dumps({"source": "web"}), 100)
+        )
+        conn.commit()
+        conn.close()
+        
+        return jsonify({
+            'success': True,
+            'session_id': session_id
+        })
+        
+    except Exception as e:
+        print(f"Error starting web session: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/web-heartbeat', methods=['POST'])
+def web_heartbeat():
+    """Web client sends heartbeat"""
+    try:
+        data = request.json
+        session_id = data.get('session_id')
+        
+        if session_id in active_web_sessions:
+            active_web_sessions[session_id]['last_heartbeat'] = datetime.now().isoformat()
+            return jsonify({'status': 'ok'})
+        return jsonify({'status': 'error', 'message': 'Session not found'}), 404
+    except Exception as e:
+        print(f"Heartbeat error: {e}")
+        return jsonify({'status': 'error'}), 500
+
+@app.route('/api/end-web-session', methods=['POST'])
+def end_web_session():
+    """End a web proctoring session"""
+    try:
+        data = request.json
+        session_id = data.get('session_id')
+        
+        if session_id in active_web_sessions:
+            del active_web_sessions[session_id]
+            
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"Error ending session: {e}")
+        return jsonify({'error': str(e)}), 500
 
 # ===================================================
 # 🔹 PROCTORING DATA ENDPOINT
@@ -479,7 +577,7 @@ def log_data():
         if not data:
             return jsonify({"status": "error", "message": "Invalid JSON"}), 400
         
-        is_web_alert = data.get('source') == 'web'
+        source = data.get('source', 'web')
         student_id = data.get('student_id')
         session_id = data.get('session_id')
         
@@ -489,40 +587,51 @@ def log_data():
         current_alerts_list = data.get('alerts', [])
         if not isinstance(current_alerts_list, list):
             current_alerts_list = []
+        
         current_alerts_set = set(current_alerts_list)
-
         last_alerts_set = SESSION_LAST_ALERTS.get(session_id, set())
-        if not is_web_alert and current_alerts_set == last_alerts_set:
-            return jsonify({"status": "success", "message": "No change"}), 200
+        
+        # Only log if alerts changed or it's from web
+        if source == 'web' or current_alerts_set != last_alerts_set:
+            SESSION_LAST_ALERTS[session_id] = current_alerts_set
 
-        SESSION_LAST_ALERTS[session_id] = current_alerts_set
-
-        if is_web_alert:
-            metrics = {"source": "web"}
-            timestamp = datetime.utcnow().isoformat() + "Z"
-        else:
             metrics = data.get('metrics', {})
             timestamp = data.get('timestamp', datetime.utcnow().isoformat() + "Z")
 
-        score = calculate_integrity_score(current_alerts_list)
-        
-        if len(current_alerts_list) > 10:
-            current_alerts_list = current_alerts_list[:10]
+            score = calculate_integrity_score(current_alerts_list)
             
-        alerts_json = json.dumps(current_alerts_list)
-        metrics_json = json.dumps(metrics)
+            if len(current_alerts_list) > 10:
+                current_alerts_list = current_alerts_list[:10]
+                
+            alerts_json = json.dumps(current_alerts_list)
+            metrics_json = json.dumps(metrics)
 
-        conn = sqlite3.connect(DATABASE_FILE, timeout=10)
-        cursor = conn.cursor()
-        sql = "INSERT INTO events (student_id, session_id, timestamp, alerts, metrics, integrity_score) VALUES (?, ?, ?, ?, ?, ?)"
-        cursor.execute(sql, (student_id, session_id, timestamp, alerts_json, metrics_json, score))
-        conn.commit()
-        conn.close()
-        
-        if not current_alerts_list:
-            SESSION_LAST_ALERTS.pop(session_id, None)
+            conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+            cursor = conn.cursor()
+            sql = "INSERT INTO events (student_id, session_id, timestamp, alerts, metrics, integrity_score) VALUES (?, ?, ?, ?, ?, ?)"
+            cursor.execute(sql, (student_id, session_id, timestamp, alerts_json, metrics_json, score))
+            conn.commit()
+            conn.close()
             
-        return jsonify({"status": "success", "message": "Data logged"}), 200
+            # Update active session
+            if session_id in active_web_sessions:
+                if current_alerts_list:
+                    active_web_sessions[session_id]['alerts'].extend(current_alerts_list)
+                    # Keep last 10 alerts
+                    active_web_sessions[session_id]['alerts'] = active_web_sessions[session_id]['alerts'][-10:]
+            
+            # Emit via WebSocket for live monitoring
+            for alert in current_alerts_list:
+                socketio.emit('new_alert', {
+                    'student_id': student_id,
+                    'session_id': session_id,
+                    'alert': alert,
+                    'timestamp': timestamp
+                })
+            
+            return jsonify({"status": "success", "message": "Data logged"}), 200
+        
+        return jsonify({"status": "success", "message": "No change"}), 200
         
     except Exception as e:
         print(f"Error in log_data: {e}")
@@ -531,32 +640,25 @@ def log_data():
 # ===================================================
 # 🔹 LIVE MONITORING ENDPOINTS
 # ===================================================
-@app.route('/log_live_alert', methods=['POST'])
-def log_live_alert():
-    try:
-        data = request.get_json()
-        
-        socketio.emit('new_alert', {
-            'student_id': data.get('student_id'),
-            'session_id': data.get('session_id'),
-            'alert': data.get('alert'),
-            'timestamp': datetime.utcnow().isoformat() + "Z"
-        }, room='proctors')
-        
-        return jsonify({"status": "success"}), 200
-    except Exception as e:
-        print(f"Error in live alert: {e}")
-        return jsonify({"status": "error"}), 500
-
 @app.route('/api/active_sessions', methods=['GET'])
 def get_active_sessions():
-    from websocket_manager import active_sessions
-    return jsonify(list(active_sessions.values()))
+    """Get all active web proctoring sessions"""
+    sessions_list = []
+    for session_id, data in active_web_sessions.items():
+        sessions_list.append({
+            'student_id': data['username'],
+            'session_id': session_id,
+            'exam_id': data['exam_id'],
+            'started_at': data['started_at'],
+            'last_heartbeat': data['last_heartbeat'],
+            'alert_count': len(data['alerts']),
+            'recent_alerts': data['alerts'][-5:] if data['alerts'] else []
+        })
+    return jsonify(sessions_list)
 
 # ===================================================
 # 🔹 ANALYTICS ENDPOINTS
 # ===================================================
-
 @app.route('/api/analytics/session/<session_id>', methods=['GET'])
 def get_session_analytics(session_id):
     try:
@@ -579,22 +681,9 @@ def get_exam_analytics(exam_id):
         print(f"Analytics error: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route('/api/analytics/charts/<session_id>', methods=['GET'])
-def get_session_charts(session_id):
-    try:
-        analytics = analytics_engine.get_session_analytics(session_id)
-        if analytics:
-            charts = analytics_engine.generate_charts(analytics, type='session')
-            return jsonify(charts)
-        return jsonify({"error": "Session not found"}), 404
-    except Exception as e:
-        print(f"Chart generation error: {e}")
-        return jsonify({"error": str(e)}), 500
-
 # ===================================================
 # 🔹 EXPORT ENDPOINTS
 # ===================================================
-
 @app.route('/api/export/session/<session_id>', methods=['GET'])
 def export_session_data(session_id):
     try:
@@ -644,25 +733,6 @@ def export_exam_data(exam_id):
 # ===================================================
 # 🔹 REPORTING ENDPOINTS
 # ===================================================
-@app.route('/get_sessions/<student_id>', methods=['GET'])
-def get_sessions(student_id):
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT DISTINCT session_id FROM events WHERE student_id = ? ORDER BY session_id DESC", (student_id,))
-    sessions = [row[0] for row in cursor.fetchall()]
-    conn.close()
-    return jsonify(sessions)
-
-@app.route('/get_data/<student_id>/<session_id>', methods=['GET'])
-def get_data(student_id, session_id):
-    conn = sqlite3.connect(DATABASE_FILE)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM events WHERE student_id = ? AND session_id = ? ORDER BY timestamp DESC", (student_id, session_id))
-    rows = [dict(row) for row in cursor.fetchall()]
-    conn.close()
-    return jsonify(rows)
-
 @app.route('/generate_report/<student_id>/<session_id>', methods=['GET'])
 def download_report(student_id, session_id):
     SESSION_LAST_ALERTS.pop(session_id, None)
@@ -692,14 +762,164 @@ def download_report(student_id, session_id):
     else:
         return "Could not generate report: No data for this session.", 404
 
+# ===================================================
+# 🔹 FALLBACK FOR TESTING - SIMULATE AGENT
+# ===================================================
+
+@app.route('/api/simulate-agent-start/<session_id>', methods=['POST'])
+def simulate_agent_start(session_id):
+    """For testing: manually mark an agent as running"""
+    try:
+        data = request.json
+        username = data.get('username', 'test')
+        exam_id = data.get('exam_id', '1')
+        
+        active_agent_sessions[session_id] = {
+            'pid': 12345,  # Fake PID
+            'username': username,
+            'exam_id': exam_id,
+            'started_at': datetime.now().isoformat()
+        }
+        
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/test-alert', methods=['POST'])
+def test_alert():
+    """Test endpoint to manually add an alert"""
+    try:
+        data = request.json
+        student_id = data.get('student_id')
+        session_id = data.get('session_id')
+        alert = data.get('alert')
+        
+        if not all([student_id, session_id, alert]):
+            return jsonify({"error": "Missing parameters"}), 400
+        
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        
+        # Calculate a lower score for test alerts
+        score = 50
+        
+        cursor.execute(
+            "INSERT INTO events (student_id, session_id, timestamp, alerts, metrics, integrity_score) VALUES (?, ?, ?, ?, ?, ?)",
+            (student_id, session_id, datetime.utcnow().isoformat() + "Z", 
+             json.dumps([alert]), json.dumps({"test": True, "source": "test_endpoint"}), score)
+        )
+        conn.commit()
+        conn.close()
+        
+        return jsonify({"success": True, "message": f"Alert '{alert}' added", "score": score})
+    except Exception as e:
+        print(f"Error in test-alert: {e}")
+        return jsonify({"error": str(e)}), 500
+    
+
+@app.route('/api/debug/all-sessions', methods=['GET'])
+def debug_all_sessions():
+    """Debug endpoint to see all sessions"""
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        # Get all distinct sessions with summary
+        cursor.execute("""
+            SELECT 
+                session_id, 
+                student_id,
+                COUNT(*) as event_count,
+                MIN(timestamp) as start_time,
+                MAX(timestamp) as end_time,
+                AVG(integrity_score) as avg_score,
+                MIN(integrity_score) as min_score
+            FROM events 
+            GROUP BY session_id, student_id
+            ORDER BY start_time DESC
+            LIMIT 20
+        """)
+        
+        sessions = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        
+        return jsonify({
+            'total_sessions': len(sessions),
+            'sessions': sessions
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/debug/session/<session_id>', methods=['GET'])
+def debug_session(session_id):
+    """Debug endpoint to see raw data for a session"""
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        # Get all events for this session
+        cursor.execute("""
+            SELECT id, student_id, session_id, timestamp, alerts, metrics, integrity_score
+            FROM events 
+            WHERE session_id = ?
+            ORDER BY timestamp
+        """, (session_id,))
+        
+        events = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        
+        # Parse JSON fields for display
+        for event in events:
+            if event.get('alerts'):
+                try:
+                    event['alerts'] = json.loads(event['alerts'])
+                except:
+                    pass
+            if event.get('metrics'):
+                try:
+                    event['metrics'] = json.loads(event['metrics'])
+                except:
+                    pass
+        
+        return jsonify({
+            'session_id': session_id,
+            'total_events': len(events),
+            'events': events
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+# ===================================================
+# 🔹 WEBSOCKET EVENTS
+# ===================================================
+@socketio.on('connect')
+def handle_connect():
+    print(f'Client connected: {request.sid}')
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print(f'Client disconnected: {request.sid}')
+
+@socketio.on('join_proctor')
+def handle_join_proctor():
+    """Proctor joins to monitor sessions"""
+    join_room('proctors')
+    print(f'Proctor joined: {request.sid}')
+
 if __name__ == '__main__':
     init_db()
     
-    # Create client_binaries directory if it doesn't exist
-    os.makedirs('client_binaries', exist_ok=True)
+    print("="*60)
+    print("🚀 ProctorAI+ Backend Starting...")
+    print("="*60)
+    print("✅ Database initialized")
+    print("✅ Analytics Engine Ready")
+    print("✅ WebSocket Server Ready")
+    print("✅ Background Agent Support Enabled")
+    print("="*60)
+    print("📡 Server running on http://localhost:5000")
+    print("="*60)
     
-    print("Starting server with WebSocket and Analytics support...")
-    print("✅ Phase 1: Live Monitoring Active")
-    print("✅ Phase 2: Analytics Engine Ready")
-    print("✅ Phase 3: Auto-Launch Support Active")
-    socketio.run(app, host='0.0.0.0', port=5000, debug=True, allow_unsafe_werkzeug=True)
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True)

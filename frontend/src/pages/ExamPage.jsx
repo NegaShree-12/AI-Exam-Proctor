@@ -1,17 +1,21 @@
+// frontend/src/pages/ExamPage.jsx
 import React, { useState, useEffect, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import axios from "axios";
 import Header from "../components/Header";
+import WebProctor from "../components/WebProctor";
 import {
-  Download,
   Play,
   AlertCircle,
   CheckCircle,
   Loader,
-  Copy,
-  Terminal,
+  Shield,
+  EyeOff,
+  Volume2,
+  Camera,
   MonitorSmartphone,
-  ExternalLink,
+  XCircle,
+  AlertTriangle,
 } from "lucide-react";
 
 const API_URL = "http://127.0.0.1:5000";
@@ -21,22 +25,25 @@ function ExamPage() {
   const [exam, setExam] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [step, setStep] = useState("instructions"); // instructions, downloading, waiting, active, exam
-  const [sessionToken, setSessionToken] = useState(null);
+  const [step, setStep] = useState("instructions");
   const [sessionId, setSessionId] = useState(null);
-  const [downloadProgress, setDownloadProgress] = useState(0);
-  const [clientStatus, setClientStatus] = useState("disconnected");
-  const [downloadUrl, setDownloadUrl] = useState("");
-  const [clientCommand, setClientCommand] = useState("");
-  const [clientFilename, setClientFilename] = useState("ProctorAI.exe");
-  const [copySuccess, setCopySuccess] = useState(false);
-  const [autoDetect, setAutoDetect] = useState(true);
-  const [downloadAttempts, setDownloadAttempts] = useState(0);
+  const [answers, setAnswers] = useState({});
+  const [permissions, setPermissions] = useState({
+    camera: false,
+    mic: false,
+  });
+  const [permissionError, setPermissionError] = useState(null);
+  const [cameraStream, setCameraStream] = useState(null);
+  const [cameraActive, setCameraActive] = useState(false);
+  const [webAlerts, setWebAlerts] = useState([]);
+  const [showAlertPanel, setShowAlertPanel] = useState(false);
+  const [alertCount, setAlertCount] = useState(0);
+
+  const videoRef = useRef(null);
+  const detectionInterval = useRef(null);
 
   const { examId } = useParams();
   const navigate = useNavigate();
-  const statusCheckInterval = useRef(null);
-  const downloadInterval = useRef(null);
 
   useEffect(() => {
     const storedUser = JSON.parse(localStorage.getItem("proctorUser"));
@@ -66,203 +73,243 @@ function ExamPage() {
     fetchExamDetails();
   }, [examId, user]);
 
-  // Cleanup intervals on unmount
+  // Clean up on unmount
   useEffect(() => {
     return () => {
-      if (statusCheckInterval.current) {
-        clearInterval(statusCheckInterval.current);
+      if (cameraStream) {
+        cameraStream.getTracks().forEach((track) => track.stop());
       }
-      if (downloadInterval.current) {
-        clearInterval(downloadInterval.current);
+      if (detectionInterval.current) {
+        clearInterval(detectionInterval.current);
       }
     };
-  }, []);
+  }, [cameraStream]);
 
-  const handleStartExam = async () => {
-    try {
-      setStep("downloading");
+  // Handle alerts from WebProctor
+  const handleProctorAlert = async (alert) => {
+    console.log("⚠️ Alert from proctor:", alert);
+    setWebAlerts((prev) => [alert, ...prev].slice(0, 20));
+    setAlertCount((prev) => prev + 1);
+    setShowAlertPanel(true);
 
-      // Request session from backend
-      const response = await axios.post(`${API_URL}/api/start-client-session`, {
-        username: user.username,
-        exam_id: examId,
-      });
+    // Auto-hide alert panel after 3 seconds
+    setTimeout(() => {
+      setShowAlertPanel(false);
+    }, 3000);
 
-      const {
-        session_token,
-        session_id,
-        download_url,
-        command,
-        client_filename,
-      } = response.data;
-
-      setSessionToken(session_token);
-      setSessionId(session_id);
-      setDownloadUrl(download_url);
-      setClientCommand(command);
-      setClientFilename(client_filename);
-
-      // Start download simulation
-      simulateDownload();
-    } catch (error) {
-      console.error("Failed to start client session:", error);
-      setError("Failed to start proctoring session. Please try again.");
-      setStep("instructions");
-    }
-  };
-
-  const simulateDownload = () => {
-    let progress = 0;
-    downloadInterval.current = setInterval(() => {
-      progress += 10;
-      setDownloadProgress(progress);
-
-      if (progress >= 100) {
-        clearInterval(downloadInterval.current);
-
-        // Try to download the actual file
-        downloadClientFile();
-
-        // Move to waiting step
-        setStep("waiting");
-        startClientStatusCheck();
-      }
-    }, 300);
-  };
-
-  // 🔥 UPDATED: Improved download function with GitHub fallback
-  const downloadClientFile = async () => {
-    setDownloadAttempts((prev) => prev + 1);
-
-    try {
-      console.log(
-        `Attempting to download: ${API_URL}/api/download-client/${clientFilename}`,
-      );
-
-      // Try to download from backend first
-      const response = await fetch(
-        `${API_URL}/api/download-client/${clientFilename}`,
-        {
-          method: "GET",
-          headers: {
-            Accept: "application/octet-stream",
-          },
-        },
-      );
-
-      if (response.redirected) {
-        // If backend redirected to GitHub, open in new tab
-        console.log("Redirected to:", response.url);
-        window.open(response.url, "_blank");
-      } else if (response.ok) {
-        // Direct download from backend
-        const blob = await response.blob();
-        const url = window.URL.createObjectURL(blob);
-        const link = document.createElement("a");
-        link.href = url;
-        link.download = clientFilename;
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-        window.URL.revokeObjectURL(url);
-      } else {
-        // Check if response is JSON (error message)
-        const contentType = response.headers.get("content-type");
-        if (contentType && contentType.includes("application/json")) {
-          const errorData = await response.json();
-          console.log("Server returned error:", errorData);
-
-          // Use the download_url from error if available
-          if (errorData.download_url) {
-            window.open(errorData.download_url, "_blank");
-          } else {
-            // Fallback to GitHub
-            const githubUrl = `https://github.com/vishwas2222/ProctorAI-Plus/releases/download/v1.0.0/${clientFilename}`;
-            window.open(githubUrl, "_blank");
-          }
-        } else {
-          // Fallback to GitHub
-          const githubUrl = `https://github.com/vishwas2222/ProctorAI-Plus/releases/download/v1.0.0/${clientFilename}`;
-          window.open(githubUrl, "_blank");
-        }
-      }
-    } catch (error) {
-      console.error("Download failed:", error);
-
-      // Ultimate fallback - try GitHub directly
-      if (downloadAttempts < 3) {
-        // Try one more time with a different approach
-        setTimeout(() => {
-          const githubUrl = `https://github.com/vishwas2222/ProctorAI-Plus/releases/download/v1.0.0/${clientFilename}`;
-          window.open(githubUrl, "_blank");
-        }, 1000);
-      } else {
-        // Show manual download instructions
-        alert(
-          "Please download the client manually from:\n" +
-            `https://github.com/vishwas2222/ProctorAI-Plus/releases/download/v1.0.0/${clientFilename}`,
-        );
-      }
-    }
-  };
-
-  const startClientStatusCheck = () => {
-    // Start checking if client is running
-    statusCheckInterval.current = setInterval(async () => {
+    // Send alert to backend immediately
+    if (sessionId && user) {
       try {
-        const response = await axios.get(
-          `${API_URL}/api/check-client-status/${sessionToken}`,
-        );
-
-        if (response.data.status === "active") {
-          setClientStatus("connected");
-          setStep("active");
-          clearInterval(statusCheckInterval.current);
-
-          // Show success for 2 seconds then start exam
-          setTimeout(() => {
-            setStep("exam");
-          }, 2000);
-        }
-      } catch (error) {
-        // Client not connected yet, continue waiting
-        console.log("Waiting for client to connect...");
+        await axios.post(`${API_URL}/log_data`, {
+          source: "web",
+          student_id: user.username,
+          session_id: sessionId,
+          alerts: [alert],
+          metrics: {
+            alert_type: alert,
+            timestamp: new Date().toISOString(),
+            face_count: parseInt(alert.match(/\d+/)?.[0] || "0"),
+          },
+          timestamp: new Date().toISOString(),
+        });
+        console.log("✅ Alert sent to backend");
+      } catch (err) {
+        console.error("Failed to send alert:", err);
       }
-    }, 2000);
+    }
   };
 
-  const copyCommandToClipboard = () => {
-    navigator.clipboard.writeText(clientCommand);
-    setCopySuccess(true);
-    setTimeout(() => setCopySuccess(false), 2000);
+  // Start face detection after camera is active
+  const startFaceDetection = () => {
+    if (!videoRef.current || !videoRef.current.srcObject) return;
+
+    detectionInterval.current = setInterval(() => {
+      if (videoRef.current && videoRef.current.videoWidth > 0) {
+        sendProctoringHeartbeat(true);
+      } else {
+        sendProctoringHeartbeat(false);
+      }
+    }, 3000);
   };
 
-  const handleManualContinue = () => {
-    // Skip waiting and go to exam (for testing)
-    setStep("exam");
-  };
+  // Send proctoring data to backend
+  const sendProctoringHeartbeat = async (cameraWorking) => {
+    if (!sessionId) return;
 
-  const handleSubmitExam = async () => {
-    // Send final alert
-    if (sessionId) {
+    try {
       await axios.post(`${API_URL}/log_data`, {
         source: "web",
         student_id: user.username,
         session_id: sessionId,
-        alerts: ["Exam submitted"],
+        alerts: cameraWorking ? [] : ["Camera feed not available"],
+        metrics: {
+          camera_active: cameraWorking,
+          mic_active: permissions.mic,
+          face_detected: cameraWorking,
+          timestamp: new Date().toISOString(),
+        },
         timestamp: new Date().toISOString(),
       });
+    } catch (err) {
+      console.error("Heartbeat failed:", err);
     }
+  };
 
-    navigate("/student/dashboard");
+  // Check and activate camera
+  const activateCamera = async () => {
+    setPermissionError(null);
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+          facingMode: "user",
+        },
+        audio: true,
+      });
+
+      setCameraStream(stream);
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+
+        await new Promise((resolve) => {
+          videoRef.current.onloadedmetadata = () => {
+            videoRef.current.play();
+            resolve();
+          };
+        });
+
+        setCameraActive(true);
+      }
+
+      const videoTracks = stream.getVideoTracks();
+      const audioTracks = stream.getAudioTracks();
+
+      const hasCamera =
+        videoTracks.length > 0 && videoTracks[0].readyState === "live";
+      const hasMic =
+        audioTracks.length > 0 && audioTracks[0].readyState === "live";
+
+      setPermissions({ camera: hasCamera, mic: hasMic });
+
+      return hasCamera && hasMic;
+    } catch (err) {
+      console.error("Camera activation error:", err);
+      let errorMsg = "Camera and microphone access are required";
+
+      if (err.name === "NotAllowedError") {
+        errorMsg =
+          "Camera and microphone access denied. Please allow access in browser settings and reload.";
+      } else if (err.name === "NotFoundError") {
+        errorMsg = "No camera or microphone found on this device.";
+      } else if (err.name === "NotReadableError") {
+        errorMsg = "Camera is already in use by another application.";
+      }
+
+      setPermissionError(errorMsg);
+      setPermissions({ camera: false, mic: false });
+      return false;
+    }
+  };
+
+  const handleStartExam = async () => {
+    try {
+      setStep("starting");
+
+      // Activate camera first
+      const cameraActivated = await activateCamera();
+      if (!cameraActivated) {
+        setStep("instructions");
+        return;
+      }
+
+      // Generate session ID
+      const newSessionId = `exam_${examId}_${user.username}_${Date.now()}`;
+      setSessionId(newSessionId);
+
+      // Log exam start with camera confirmed working
+      await axios.post(`${API_URL}/log_data`, {
+        source: "web",
+        student_id: user.username,
+        session_id: newSessionId,
+        alerts: ["Exam started - Camera active"],
+        metrics: {
+          camera_active: true,
+          mic_active: permissions.mic,
+          timestamp: new Date().toISOString(),
+        },
+        timestamp: new Date().toISOString(),
+      });
+
+      // Start face detection
+      startFaceDetection();
+
+      // Wait 2 seconds to show camera is working, then start exam
+      setTimeout(() => {
+        setStep("exam");
+      }, 2000);
+    } catch (error) {
+      console.error("Failed to start:", error);
+      setError("Failed to start proctoring. Please try again.");
+      setStep("instructions");
+
+      if (cameraStream) {
+        cameraStream.getTracks().forEach((track) => track.stop());
+        setCameraStream(null);
+      }
+    }
+  };
+
+  const handleSubmitExam = async () => {
+    try {
+      // Stop camera stream
+      if (cameraStream) {
+        cameraStream.getTracks().forEach((track) => track.stop());
+        setCameraStream(null);
+      }
+
+      // Clear detection interval
+      if (detectionInterval.current) {
+        clearInterval(detectionInterval.current);
+      }
+
+      // Log submission with alert summary
+      if (sessionId) {
+        await axios.post(`${API_URL}/log_data`, {
+          source: "web",
+          student_id: user.username,
+          session_id: sessionId,
+          alerts: [`Exam submitted - Total alerts: ${alertCount}`],
+          metrics: {
+            camera_active: false,
+            total_alerts: alertCount,
+            alerts_list: webAlerts.slice(0, 10),
+            timestamp: new Date().toISOString(),
+          },
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      navigate("/student/dashboard");
+    } catch (error) {
+      console.error("Error submitting:", error);
+      navigate("/student/dashboard");
+    }
+  };
+
+  const handleAnswerChange = (questionId, value) => {
+    setAnswers((prev) => ({
+      ...prev,
+      [questionId]: value,
+    }));
   };
 
   if (loading || !user) {
     return (
       <div className="min-h-screen bg-gray-100 flex items-center justify-center">
-        <p className="text-lg font-semibold text-indigo-600 animate-pulse">
-          Loading Exam...
-        </p>
+        <Loader className="w-8 h-8 text-indigo-600 animate-spin" />
       </div>
     );
   }
@@ -272,11 +319,9 @@ function ExamPage() {
       <div className="min-h-screen bg-gray-100">
         <Header username={user?.username || "Student"} portalType="Student" />
         <div className="max-w-xl mx-auto py-12 px-4 text-center">
-          <AlertCircle className="w-16 h-16 text-red-500 mx-auto mb-4" />
-          <h2 className="text-2xl font-bold text-red-600 mb-4">⚠️ Error</h2>
-          <p className="text-gray-700 bg-red-50 p-4 rounded border border-red-200">
-            {error}
-          </p>
+          <XCircle className="w-16 h-16 text-red-500 mx-auto mb-4" />
+          <h2 className="text-2xl font-bold text-red-600 mb-4">Error</h2>
+          <p className="text-gray-700 bg-red-50 p-4 rounded">{error}</p>
           <button
             onClick={() => navigate("/student/dashboard")}
             className="mt-6 px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700"
@@ -293,98 +338,78 @@ function ExamPage() {
     return (
       <div className="min-h-screen bg-gray-100">
         <Header username={user.username} portalType="Student" />
-        <div className="max-w-4xl mx-auto py-10 px-4">
-          <div className="bg-white p-8 rounded-2xl shadow-xl space-y-6">
-            {/* Exam Title */}
-            <div className="text-center border-b pb-4">
-              <h1 className="text-3xl font-extrabold text-gray-900">
+        <div className="max-w-2xl mx-auto py-10 px-4">
+          <div className="bg-white p-8 rounded-2xl shadow-xl">
+            <div className="text-center mb-6">
+              <Shield className="w-16 h-16 text-indigo-600 mx-auto mb-4" />
+              <h1 className="text-3xl font-bold text-gray-900 mb-2">
                 {exam?.title}
               </h1>
-              {exam?.description && (
-                <p className="mt-2 text-gray-600">{exam.description}</p>
-              )}
+              <p className="text-gray-600">
+                {exam?.description || "AI-Proctored Examination"}
+              </p>
             </div>
 
-            {/* Rules Section */}
-            <div className="bg-yellow-50 border-l-4 border-yellow-500 p-4 rounded-r-lg">
-              <h2 className="text-xl font-bold text-yellow-800 mb-3">
-                📜 Exam Rules
-              </h2>
-              <ul className="space-y-2 text-yellow-800">
+            {permissionError && (
+              <div className="bg-red-50 border border-red-200 p-4 rounded-lg mb-6">
+                <p className="text-red-700 font-medium mb-2">
+                  ⚠️ Camera Required
+                </p>
+                <p className="text-red-600 text-sm">{permissionError}</p>
+                <button
+                  onClick={() => window.location.reload()}
+                  className="mt-2 text-sm text-red-700 underline"
+                >
+                  Reload page and allow camera access
+                </button>
+              </div>
+            )}
+
+            <div className="bg-blue-50 p-4 rounded-lg mb-6">
+              <h3 className="font-semibold text-blue-800 mb-2 flex items-center">
+                <Camera className="w-4 h-4 mr-2" />
+                Privacy Notice:
+              </h3>
+              <ul className="text-blue-700 space-y-2">
                 <li className="flex items-start">
                   <span className="mr-2">•</span>
-                  <span>
-                    <strong>AI Proctoring Active:</strong> Your session will be
-                    monitored
-                  </span>
+                  <span>Camera activates in background - you won't see it</span>
                 </li>
                 <li className="flex items-start">
                   <span className="mr-2">•</span>
-                  <span>Be alone in a quiet room</span>
+                  <span>No video is recorded or uploaded</span>
                 </li>
                 <li className="flex items-start">
                   <span className="mr-2">•</span>
-                  <span>Keep face visible to webcam at all times</span>
-                </li>
-                <li className="flex items-start">
-                  <span className="mr-2">•</span>
-                  <span>No phones, books, or other people</span>
+                  <span>Only anonymous alerts are sent</span>
                 </li>
               </ul>
             </div>
 
-            {/* One-Click Launch */}
-            <div className="bg-green-50 border border-green-200 p-6 rounded-lg">
-              <h2 className="text-xl font-bold text-green-800 mb-4 flex items-center">
-                <MonitorSmartphone className="w-5 h-5 mr-2" />
-                One-Click Launch
-              </h2>
-
-              <button
-                onClick={handleStartExam}
-                className="w-full py-4 bg-green-600 text-white text-lg font-bold rounded-lg hover:bg-green-700 transition flex items-center justify-center"
-              >
-                <Play className="w-5 h-5 mr-2" />
-                Start Exam with AI Proctoring
-              </button>
-
-              <p className="text-sm text-green-600 mt-3 text-center">
-                The proctoring agent will automatically download and launch
-              </p>
+            <div className="bg-gray-50 p-4 rounded-lg mb-6">
+              <h3 className="font-semibold text-gray-800 mb-2">Exam Rules:</h3>
+              <ul className="text-gray-700 space-y-2">
+                <li className="flex items-start">
+                  <span className="mr-2">•</span>
+                  <span>No phones, books, or other people</span>
+                </li>
+                <li className="flex items-start">
+                  <span className="mr-2">•</span>
+                  <span>Stay in frame and face the camera</span>
+                </li>
+                <li className="flex items-start">
+                  <span className="mr-2">•</span>
+                  <span>No talking or reading aloud</span>
+                </li>
+              </ul>
             </div>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // Downloading Step
-  if (step === "downloading") {
-    return (
-      <div className="min-h-screen bg-gray-100">
-        <Header username={user.username} portalType="Student" />
-        <div className="max-w-md mx-auto py-20 px-4">
-          <div className="bg-white p-8 rounded-2xl shadow-xl text-center">
-            <Loader className="w-16 h-16 text-blue-600 animate-spin mx-auto mb-4" />
-            <h2 className="text-2xl font-bold mb-2">
-              Preparing Proctoring Agent
-            </h2>
-
-            {/* Progress Bar */}
-            <div className="w-full bg-gray-200 rounded-full h-2.5 mb-4">
-              <div
-                className="bg-blue-600 h-2.5 rounded-full transition-all duration-300"
-                style={{ width: `${downloadProgress}%` }}
-              ></div>
-            </div>
-
-            <p className="text-gray-600">{downloadProgress}% complete</p>
 
             <button
-              onClick={downloadClientFile}
-              className="mt-6 text-blue-600 hover:text-blue-800 text-sm"
+              onClick={handleStartExam}
+              className="w-full py-4 bg-indigo-600 text-white text-lg font-bold rounded-lg hover:bg-indigo-700 flex items-center justify-center transition"
             >
-              Download manually instead
+              <Play className="w-5 h-5 mr-2" />
+              Start Exam
             </button>
           </div>
         </div>
@@ -392,206 +417,220 @@ function ExamPage() {
     );
   }
 
-  // Waiting for Client
-  if (step === "waiting") {
-    return (
-      <div className="min-h-screen bg-gray-100">
-        <Header username={user.username} portalType="Student" />
-        <div className="max-w-2xl mx-auto py-10 px-4">
-          <div className="bg-white p-8 rounded-2xl shadow-xl">
-            <div className="text-center mb-8">
-              <div className="w-20 h-20 bg-yellow-100 rounded-full mx-auto mb-4 flex items-center justify-center">
-                <Terminal className="w-10 h-10 text-yellow-600" />
-              </div>
-              <h2 className="text-2xl font-bold mb-2">
-                Launch the Proctoring Agent
-              </h2>
-              <p className="text-gray-600">
-                The download should start automatically. If not, click below.
-              </p>
-            </div>
-
-            {/* Download Button */}
-            <div className="mb-6">
-              <button
-                onClick={downloadClientFile}
-                className="w-full py-3 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 flex items-center justify-center"
-              >
-                <Download className="w-4 h-4 mr-2" />
-                Download {clientFilename} Again
-              </button>
-            </div>
-
-            {/* GitHub Direct Link */}
-            <div className="mb-4 text-center">
-              <a
-                href={`https://github.com/vishwas2222/ProctorAI-Plus/releases/download/v1.0.0/${clientFilename}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-sm text-blue-600 hover:text-blue-800 flex items-center justify-center"
-              >
-                <ExternalLink className="w-3 h-3 mr-1" />
-                Download directly from GitHub
-              </a>
-            </div>
-
-            {/* Command to Run */}
-            <div className="bg-gray-50 p-4 rounded-lg mb-4">
-              <p className="text-sm font-medium text-gray-700 mb-2">
-                After downloading, run this command in terminal:
-              </p>
-              <div className="bg-gray-800 p-3 rounded flex items-center justify-between">
-                <code className="text-green-300 text-sm font-mono select-all">
-                  {clientCommand}
-                </code>
-                <button
-                  onClick={copyCommandToClipboard}
-                  className="ml-2 p-2 bg-gray-700 rounded hover:bg-gray-600 transition"
-                >
-                  {copySuccess ? (
-                    <CheckCircle className="w-4 h-4 text-green-500" />
-                  ) : (
-                    <Copy className="w-4 h-4 text-gray-300" />
-                  )}
-                </button>
-              </div>
-            </div>
-
-            {/* Status */}
-            <div className="text-center">
-              <p className="text-sm text-gray-500 mb-2">
-                Status:{" "}
-                {clientStatus === "connected"
-                  ? "✅ Connected"
-                  : "⏳ Waiting for connection..."}
-              </p>
-
-              {autoDetect && (
-                <p className="text-xs text-gray-400">
-                  Auto-detecting client connection...
-                </p>
-              )}
-            </div>
-
-            {/* Manual override for testing */}
-            <button
-              onClick={handleManualContinue}
-              className="mt-4 text-sm text-blue-600 hover:text-blue-800"
-            >
-              Continue to exam (for testing)
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // Client Connected - Success
-  if (step === "active") {
+  // Starting - Camera activation step
+  if (step === "starting") {
     return (
       <div className="min-h-screen bg-gray-100">
         <Header username={user.username} portalType="Student" />
         <div className="max-w-md mx-auto py-20 px-4">
           <div className="bg-white p-8 rounded-2xl shadow-xl text-center">
-            <CheckCircle className="w-20 h-20 text-green-500 mx-auto mb-4" />
-            <h2 className="text-2xl font-bold text-green-700 mb-2">
-              Proctoring Agent Connected!
-            </h2>
+            <Loader className="w-16 h-16 text-indigo-600 animate-spin mx-auto mb-4" />
+            <h2 className="text-2xl font-bold mb-2">Starting Proctoring</h2>
             <p className="text-gray-600 mb-6">
-              Your exam session is now being monitored by AI
+              Initializing background monitoring...
             </p>
-            <div className="animate-pulse">
-              <p className="text-sm text-gray-500">
-                Starting exam in a moment...
-              </p>
+
+            {/* Hidden video element for camera activation */}
+            <video
+              ref={videoRef}
+              style={{ display: "none" }}
+              autoPlay
+              playsInline
+              muted
+            />
+
+            <div className="space-y-3 text-left bg-gray-50 p-4 rounded-lg">
+              <div className="flex items-center justify-between">
+                <span className="flex items-center">
+                  <Camera className="w-4 h-4 mr-2 text-gray-600" />
+                  Camera access
+                </span>
+                {permissions.camera ? (
+                  <CheckCircle className="w-5 h-5 text-green-500" />
+                ) : (
+                  <Loader className="w-4 h-4 animate-spin text-indigo-500" />
+                )}
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="flex items-center">
+                  <Volume2 className="w-4 h-4 mr-2 text-gray-600" />
+                  Microphone access
+                </span>
+                {permissions.mic ? (
+                  <CheckCircle className="w-5 h-5 text-green-500" />
+                ) : (
+                  <Loader className="w-4 h-4 animate-spin text-indigo-500" />
+                )}
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="flex items-center">
+                  <MonitorSmartphone className="w-4 h-4 mr-2 text-gray-600" />
+                  AI Monitoring
+                </span>
+                <CheckCircle className="w-5 h-5 text-green-500" />
+              </div>
             </div>
+
+            {permissions.camera && permissions.mic && (
+              <div className="mt-4 text-green-600 text-sm">
+                ✓ Camera and microphone ready
+              </div>
+            )}
+
+            <p className="text-xs text-gray-400 mt-4">
+              Starting exam in a moment...
+            </p>
           </div>
         </div>
       </div>
     );
   }
 
-  // Live Exam View
-  if (step === "exam") {
-    return (
-      <div className="min-h-screen bg-gray-100">
-        <Header
-          username={user.username}
-          portalType="Student - Proctoring Active"
+  // Exam in Progress - Camera active in background
+  return (
+    <div className="min-h-screen bg-gray-100">
+      <Header
+        username={user.username}
+        portalType="Student - Proctoring Active"
+      />
+
+      {/* Hidden video element for camera monitoring */}
+      <video
+        ref={videoRef}
+        style={{ display: "none" }}
+        autoPlay
+        playsInline
+        muted
+      />
+
+      {/* WebProctor Component for face detection */}
+      <div className="fixed bottom-4 right-4 w-48 h-36 rounded-lg overflow-hidden shadow-lg border-2 border-indigo-500 z-20 bg-black">
+        <WebProctor
+          onAlert={handleProctorAlert}
+          sessionId={sessionId}
+          studentId={user?.username}
+          onReady={() => console.log("Web proctor ready")}
         />
-        <div className="max-w-5xl mx-auto py-8 px-4">
-          <div className="bg-white p-6 rounded-lg shadow-xl">
-            {/* Header with Status */}
-            <div className="flex justify-between items-center mb-6 pb-4 border-b">
-              <h1 className="text-2xl font-bold text-gray-900">
-                {exam?.title}
-              </h1>
-              <div className="flex items-center space-x-3">
-                <div className="flex items-center">
-                  <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse mr-2"></div>
-                  <span className="text-sm text-gray-600">AI Monitoring</span>
-                </div>
-                <span className="px-3 py-1 bg-red-100 text-red-800 font-medium rounded-full text-xs">
-                  EXAM IN PROGRESS
+        <div className="absolute bottom-0 left-0 right-0 bg-black bg-opacity-70 text-white text-xs text-center py-1">
+          AI Monitoring Active
+        </div>
+      </div>
+
+      {/* Alert Notification Popup */}
+      {showAlertPanel && webAlerts.length > 0 && (
+        <div className="fixed top-20 right-4 z-30 animate-bounce">
+          <div className="bg-red-500 text-white p-3 rounded-lg shadow-lg max-w-xs">
+            <div className="flex items-start">
+              <AlertTriangle className="w-5 h-5 mr-2 flex-shrink-0 mt-0.5" />
+              <div>
+                <p className="font-semibold text-sm">Violation Detected!</p>
+                <p className="text-xs">{webAlerts[0]}</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="max-w-4xl mx-auto py-8 px-4">
+        <div className="bg-white p-6 rounded-lg shadow-xl">
+          {/* Status Bar */}
+          <div className="flex justify-between items-center mb-6 pb-4 border-b">
+            <h1 className="text-2xl font-bold text-gray-900">{exam?.title}</h1>
+            <div className="flex items-center space-x-3">
+              <div className="flex items-center">
+                <div
+                  className={`w-2 h-2 rounded-full animate-pulse mr-2 ${cameraActive ? "bg-green-500" : "bg-red-500"}`}
+                ></div>
+                <span className="text-sm text-gray-600">
+                  {cameraActive ? "Camera Active" : "Camera Issue"}
                 </span>
               </div>
-            </div>
-
-            {/* Session Info */}
-            <div className="bg-gray-50 p-3 rounded mb-6 text-xs text-gray-500">
-              Session ID: {sessionId}
-            </div>
-
-            {/* Exam Questions */}
-            <div className="space-y-6">
-              {/* Question 1 */}
-              <div className="p-4 bg-gray-50 rounded">
-                <h3 className="font-semibold mb-2">Question 1</h3>
-                <p className="text-gray-700 mb-3">
-                  What is the primary function of mitochondria?
-                </p>
-                <div className="space-y-2">
-                  <label className="flex items-center p-2 bg-white rounded cursor-pointer hover:bg-indigo-50">
-                    <input type="radio" name="q1" className="mr-3" />
-                    Powerhouse of the cell
-                  </label>
-                  <label className="flex items-center p-2 bg-white rounded cursor-pointer hover:bg-indigo-50">
-                    <input type="radio" name="q1" className="mr-3" />
-                    Protein synthesis
-                  </label>
-                  <label className="flex items-center p-2 bg-white rounded cursor-pointer hover:bg-indigo-50">
-                    <input type="radio" name="q1" className="mr-3" />
-                    Cell division
-                  </label>
+              {alertCount > 0 && (
+                <div className="flex items-center">
+                  <AlertTriangle className="w-4 h-4 text-red-500 mr-1" />
+                  <span className="text-sm text-red-600 font-medium">
+                    {alertCount} Alert{alertCount !== 1 ? "s" : ""}
+                  </span>
                 </div>
-              </div>
+              )}
+              <span className="px-3 py-1 bg-red-100 text-red-800 font-medium rounded-full text-xs">
+                EXAM IN PROGRESS
+              </span>
+            </div>
+          </div>
 
-              {/* Question 2 */}
-              <div className="p-4 bg-gray-50 rounded">
-                <h3 className="font-semibold mb-2">Question 2</h3>
-                <p className="text-gray-700 mb-3">Explain what React is:</p>
-                <textarea
-                  className="w-full p-3 border rounded focus:ring-2 focus:ring-indigo-500"
-                  rows="4"
-                  placeholder="Your answer..."
-                ></textarea>
+          {/* Privacy Notice */}
+          <div className="mb-4 text-xs text-gray-400 flex items-center justify-end">
+            <EyeOff className="w-3 h-3 mr-1" />
+            Camera active in background
+          </div>
+
+          {/* Questions */}
+          <div className="space-y-6">
+            <div className="p-4 bg-gray-50 rounded">
+              <h3 className="font-semibold mb-2">Question 1</h3>
+              <p className="text-gray-700 mb-3">
+                What is the primary function of mitochondria?
+              </p>
+              <div className="space-y-2">
+                <label className="flex items-center p-2 bg-white rounded cursor-pointer hover:bg-indigo-50">
+                  <input
+                    type="radio"
+                    name="q1"
+                    value="powerhouse"
+                    className="mr-3"
+                    onChange={() => handleAnswerChange("q1", "powerhouse")}
+                  />
+                  Powerhouse of the cell
+                </label>
+                <label className="flex items-center p-2 bg-white rounded cursor-pointer hover:bg-indigo-50">
+                  <input
+                    type="radio"
+                    name="q1"
+                    value="protein"
+                    className="mr-3"
+                    onChange={() => handleAnswerChange("q1", "protein")}
+                  />
+                  Protein synthesis
+                </label>
+                <label className="flex items-center p-2 bg-white rounded cursor-pointer hover:bg-indigo-50">
+                  <input
+                    type="radio"
+                    name="q1"
+                    value="division"
+                    className="mr-3"
+                    onChange={() => handleAnswerChange("q1", "division")}
+                  />
+                  Cell division
+                </label>
               </div>
             </div>
 
-            {/* Submit Button */}
-            <div className="mt-8">
-              <button
-                onClick={handleSubmitExam}
-                className="w-full py-3 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 font-semibold"
-              >
-                Submit Exam
-              </button>
+            <div className="p-4 bg-gray-50 rounded">
+              <h3 className="font-semibold mb-2">Question 2</h3>
+              <p className="text-gray-700 mb-3">Explain what React is:</p>
+              <textarea
+                className="w-full p-3 border rounded focus:ring-2 focus:ring-indigo-500"
+                rows="4"
+                placeholder="Your answer..."
+                onChange={(e) => handleAnswerChange("q2", e.target.value)}
+              ></textarea>
             </div>
+          </div>
+
+          {/* Submit Button */}
+          <div className="mt-8">
+            <button
+              onClick={handleSubmitExam}
+              className="w-full py-3 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 font-semibold transition"
+            >
+              Submit Exam
+            </button>
           </div>
         </div>
       </div>
-    );
-  }
+    </div>
+  );
 }
 
 export default ExamPage;
